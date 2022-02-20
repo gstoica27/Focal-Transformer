@@ -5,7 +5,7 @@
 # Written by Jianwei Yang (jianwyan@microsoft.com)
 # Based on Swin Transformer written by Zhe Liu
 # --------------------------------------------------------
-
+import pdb
 import os
 import yaml
 from yacs.config import CfgNode as CN
@@ -90,6 +90,17 @@ _C.MODEL.FOCAL.USE_PRE_NORM = False
 
 # Below are specifical for Focal Transformers v2
 _C.MODEL.FOCAL.FOCAL_TOPK = 128
+
+# Below are specifical for CSAM
+_C.MODEL.CSAM = CN()
+_C.MODEL.CSAM.APPROACH_NAME = "Three"
+_C.MODEL.CSAM.POS_EMB_DIM = -1
+_C.MODEL.CSAM.SOFTMAX_TEMP = 1
+_C.MODEL.CSAM.PADDING = 'same'
+_C.MODEL.CSAM.STRIDE = 1
+_C.MODEL.CSAM.APPLY_STOCHASTIC_STRIDE = False
+_C.MODEL.CSAM.USE_RESIDUAL_CONNECTION = False
+_C.MODEL.CSAM.SUFFIX = ''
 
 # -----------------------------------------------------------------------------
 # Training settings
@@ -195,7 +206,7 @@ def _update_config_from_file(config, cfg_file):
     config.defrost()
     with open(cfg_file, 'r') as f:
         yaml_cfg = yaml.load(f, Loader=yaml.FullLoader)
-
+    # pdb.set_trace()
     for cfg in yaml_cfg.setdefault('BASE', ['']):
         if cfg:
             _update_config_from_file(
@@ -205,6 +216,16 @@ def _update_config_from_file(config, cfg_file):
     config.merge_from_file(cfg_file)
     config.freeze()
 
+def name_model(config):
+    model_name = 'CSAM_Approach{}_PosEmb{}_Temp{}_StochStride{}_Stride{}_Residual{}'.format(
+        config.APPROACH_NAME, 
+        config.POS_EMB_DIM, 
+        config.SOFTMAX_TEMP, 
+        config.APPLY_STOCHASTIC_STRIDE, 
+        config.STRIDE,
+        config.USE_RESIDUAL_CONNECTION
+    )
+    return model_name
 
 def update_config(config, args):
     _update_config_from_file(config, args.cfg)
@@ -250,6 +271,8 @@ def update_config(config, args):
     config.LOCAL_RANK = args.local_rank
 
     # output folder
+    if config.MODEL.TYPE == 'csam':
+        config.TAG = name_model(config=config.MODEL.CSAM)
     config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
 
     config.freeze()

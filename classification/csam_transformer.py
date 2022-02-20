@@ -20,6 +20,8 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.data import create_transform
 from timm.data.transforms import _pil_interp
 
+from .csam import ConvolutionalSelfAttention
+
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
@@ -120,177 +122,7 @@ def get_topk_closest_indice(q_windows, k_windows, topk=1):
     relative_coord_topk = torch.gather(relative_coords, 2, indice_topk.unsqueeze(0).repeat(2, 1, 1))
     return indice_topk, relative_coord_topk.permute(1, 2, 0).contiguous().float(), topk
 
-class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
-
-    Args:
-        dim (int): Number of input channels.
-        window_size (tuple[int]): The height and width of the window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-    """
-
-    def __init__(self, dim, input_resolution, expand_size, shift_size, window_size, window_size_glo, focal_window, 
-                    focal_level, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., pool_method="none", topK=64):
-
-        super().__init__()
-        self.dim = dim
-        self.shift_size = shift_size
-        self.expand_size = expand_size
-        self.window_size = window_size  # Wh, Ww
-        self.window_size_glo = window_size_glo
-        self.pool_method = pool_method
-        self.input_resolution = input_resolution # NWh, NWw
-        self.num_heads = num_heads
-        head_dim = dim // num_heads        
-        self.scale = qk_scale or head_dim ** -0.5
-        self.focal_level = focal_level
-        self.focal_window = focal_window
-        self.nWh, self.nWw = self.input_resolution[0] // self.window_size[0], self.input_resolution[1] // self.window_size[1]
-        
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-        self.softmax = nn.Softmax(dim=-1)
-
-        self.topK = topK
- 
-        coords_h_window = torch.arange(self.window_size[0]) - self.window_size[0] // 2
-        coords_w_window = torch.arange(self.window_size[1]) - self.window_size[1] // 2        
-        coords_window = torch.stack(torch.meshgrid([coords_h_window, coords_w_window]), dim=-1)  # 2, Wh_q, Ww_q
-        self.register_buffer("window_coords", coords_window)
-
-        self.coord2rpb_all = nn.ModuleList()
-
-        self.topks = []
-        for k in range(self.focal_level):
-            if k == 0:
-                range_h = self.input_resolution[0]
-                range_w = self.input_resolution[1]
-            else:
-                range_h = self.nWh
-                range_w = self.nWw
-            
-            # build relative position range            
-            topk_closest_indice, topk_closest_coord, topK_updated = get_topk_closest_indice(
-                (self.nWh, self.nWw), (range_h, range_w), self.topK)
-            self.topks.append(topK_updated)
-
-            if k > 0:
-                # scaling the coordinates for pooled windows
-                topk_closest_coord = topk_closest_coord * self.window_size[0]
-            topk_closest_coord_window = topk_closest_coord.unsqueeze(1) + coords_window.view(-1, 2)[None, :, None, :]
-
-            self.register_buffer("topk_cloest_indice_{}".format(k), topk_closest_indice)
-            self.register_buffer("topk_cloest_coords_{}".format(k), topk_closest_coord_window)
-
-            coord2rpb = nn.Sequential(
-                nn.Linear(2, head_dim), 
-                nn.ReLU(inplace=True),
-                nn.Linear(head_dim, self.num_heads)
-            )
-            self.coord2rpb_all.append(coord2rpb)
-
-    def forward(self, x_all, mask_all=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        x = x_all[0] # 
-
-        B, nH, nW, C = x.shape
-        qkv = self.qkv(x).reshape(B, nH, nW, 3, C).permute(3, 0, 1, 2, 4).contiguous()
-        q, k, v = qkv[0], qkv[1], qkv[2]  # B, nH, nW, C
-
-        # partition q map
-        q_windows = window_partition(q, self.window_size[0]).view(
-            -1, self.window_size[0] * self.window_size[0], self.num_heads, C // self.num_heads
-            ).transpose(1, 2)
-
-        k_all = []; v_all = []; topKs = []; topk_rpbs = []        
-        for l_k in range(self.focal_level):        
-            topk_closest_indice = getattr(self, "topk_cloest_indice_{}".format(l_k))
-            topk_indice_k = topk_closest_indice.view(1, -1).repeat(B, 1)
-
-            topk_coords_k = getattr(self, "topk_cloest_coords_{}".format(l_k))
-            window_coords = getattr(self, "window_coords")
-
-            topk_rpb_k = self.coord2rpb_all[l_k](topk_coords_k)
-            topk_rpbs.append(topk_rpb_k)
-            
-            if l_k == 0:
-                k_k = k.view(B, -1, self.num_heads, C // self.num_heads)
-                v_k = v.view(B, -1, self.num_heads, C // self.num_heads)
-            else:
-                x_k = x_all[l_k]
-                qkv_k = self.qkv(x_k).view(B, -1, 3, self.num_heads, C // self.num_heads)
-                k_k, v_k = qkv_k[:,:,1], qkv_k[:,:,2]
-
-            k_k_selected = torch.gather(k_k, 1, topk_indice_k.view(B, -1, 1).unsqueeze(-1).repeat(1, 1, self.num_heads, C // self.num_heads))
-            v_k_selected = torch.gather(v_k, 1, topk_indice_k.view(B, -1, 1).unsqueeze(-1).repeat(1, 1, self.num_heads, C // self.num_heads))
-            
-            k_k_selected = k_k_selected.view((B,) + topk_closest_indice.shape + (self.num_heads, C // self.num_heads,)).transpose(2, 3)
-            v_k_selected = v_k_selected.view((B,) + topk_closest_indice.shape + (self.num_heads, C // self.num_heads,)).transpose(2, 3)
-
-            k_all.append(k_k_selected.view(-1, self.num_heads, topk_closest_indice.shape[1], C // self.num_heads))
-            v_all.append(v_k_selected.view(-1, self.num_heads, topk_closest_indice.shape[1], C // self.num_heads))
-            topKs.append(topk_closest_indice.shape[1])
-                
-        k_all = torch.cat(k_all, 2)
-        v_all = torch.cat(v_all, 2)
-        
-        N = k_all.shape[-2]
-        q_windows = q_windows * self.scale
-        # import pdb; pdb.set_trace()
-        attn = (q_windows @ k_all.transpose(-2, -1))  # B*nW, nHead, window_size*window_size, focal_window_size*focal_window_size
-        window_area = self.window_size[0] * self.window_size[1]        
-        window_area_whole = k_all.shape[2]
-
-        topk_rpb_cat = torch.cat(topk_rpbs, 2).permute(0, 3, 1, 2).contiguous().unsqueeze(0).repeat(B, 1, 1, 1, 1).view(attn.shape)
-        attn = attn + topk_rpb_cat
-
-        attn = self.softmax(attn)        
-        attn = self.attn_drop(attn)
-        
-        x = (attn @ v_all).transpose(1, 2).flatten(2)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
-    def flops(self, N, window_size, unfold_size):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        for k in range(self.focal_level):
-            flops += self.num_heads * N * (self.dim // self.num_heads) * self.topks[k]    
-            # relative position embedding
-            if k == 0:
-                Nq = N
-            else:
-                window_size_glo = math.floor(self.window_size[0] / (2 ** (k-1)))
-                Nq = N // (window_size_glo**2)
-            flops += Nq * self.topks[k] * (2 * (self.dim // self.num_heads) + (self.dim // self.num_heads) * self.num_heads)
-
-        #  x = (attn @ v)
-        for k in range(self.focal_level):
-            flops += self.num_heads * N * (self.dim // self.num_heads) * self.topks[k]    
-   
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
-
-class FocalTransformerBlock(nn.Module):
+class CSAMBlock(nn.Module):
     r""" Focal Transformer Block.
 
     Args:
@@ -312,7 +144,9 @@ class FocalTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, expand_size=0, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm, pool_method="none",  
-                 focal_level=1, focal_window=1, topK=64, use_layerscale=False, layerscale_value=1e-4):
+                 focal_level=1, focal_window=1, topK=64, use_layerscale=False, layerscale_value=1e-4, 
+                 approach_args={'approach_name': 'Three', 'padding': 'same', 'stride': 1}
+                 ):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -348,12 +182,12 @@ class FocalTransformerBlock(nn.Module):
                     self.pool_layers.append(nn.Conv2d(dim, dim, kernel_size=window_size_glo, stride=window_size_glo, groups=dim))
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, input_resolution=input_resolution, expand_size=self.expand_size, shift_size=self.shift_size, window_size=to_2tuple(self.window_size), 
-            window_size_glo=to_2tuple(self.window_size_glo), focal_window=focal_window, 
-            focal_level=self.focal_level, num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, 
-            pool_method=pool_method, topK=topK)
+        # import pdb; pdb.set_trace()
+        self.attn = ConvolutionalSelfAttention(
+            spatial_shape=list(input_resolution) + [dim],
+            filter_size=window_size,
+            approach_args=approach_args
+        )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -402,61 +236,14 @@ class FocalTransformerBlock(nn.Module):
         else:
             shifted_x = x
         
-        x_windows_all = [shifted_x]
-        x_window_masks_all = [self.attn_mask]
-        
-        if self.focal_level > 1 and self.pool_method != "none": 
-            # if we add coarser granularity and the pool method is not none
-            for k in range(self.focal_level-1):     
-                window_size_glo = math.floor(self.window_size_glo / (2 ** k))
-                pooled_h = math.ceil(H / self.window_size) * (2 ** k)
-                pooled_w = math.ceil(W / self.window_size) * (2 ** k)
-                H_pool = pooled_h * window_size_glo
-                W_pool = pooled_w * window_size_glo
+        # import pdb; pdb.set_trace()
+        attn_windows = self.attn(shifted_x)  # nW*B, window_size*window_size, C
 
-                x_level_k = shifted_x
-                # trim or pad shifted_x depending on the required size
-                if H > H_pool:
-                    trim_t = (H - H_pool) // 2
-                    trim_b = H - H_pool - trim_t
-                    x_level_k = x_level_k[:, trim_t:-trim_b]
-                elif H < H_pool:
-                    pad_t = (H_pool - H) // 2
-                    pad_b = H_pool - H - pad_t
-                    x_level_k = F.pad(x_level_k, (0,0,0,0,pad_t,pad_b))
-                
-                if W > W_pool:
-                    trim_l = (W - W_pool) // 2
-                    trim_r = W - W_pool - trim_l
-                    x_level_k = x_level_k[:, :, trim_l:-trim_r]
-                elif W < W_pool:
-                    pad_l = (W_pool - W) // 2
-                    pad_r = W_pool - W - pad_l
-                    x_level_k = F.pad(x_level_k, (0,0,pad_l,pad_r))
-
-                x_windows_noreshape = window_partition_noreshape(x_level_k.contiguous(), window_size_glo) # B, nw, nw, window_size, window_size, C    
-                nWh, nWw = x_windows_noreshape.shape[1:3]
-                if self.pool_method == "mean":
-                    x_windows_pooled = x_windows_noreshape.mean([3, 4]) # B, nWh, nWw, C
-                elif self.pool_method == "max":
-                    x_windows_pooled = x_windows_noreshape.max(-2)[0].max(-2)[0].view(B, nWh, nWw, C) # B, nWh, nWw, C                    
-                elif self.pool_method == "fc":
-                    x_windows_noreshape = x_windows_noreshape.view(B, nWh, nWw, window_size_glo*window_size_glo, C).transpose(3, 4) # B, nWh, nWw, C, wsize**2
-                    x_windows_pooled = self.pool_layers[k](x_windows_noreshape).flatten(-2) # B, nWh, nWw, C                      
-                elif self.pool_method == "conv":
-                    x_windows_noreshape = x_windows_noreshape.view(-1, window_size_glo, window_size_glo, C).permute(0, 3, 1, 2).contiguous() # B * nw * nw, C, wsize, wsize
-                    x_windows_pooled = self.pool_layers[k](x_windows_noreshape).view(B, nWh, nWw, C) # B, nWh, nWw, C           
-
-                x_windows_all += [x_windows_pooled]
-                x_window_masks_all += [None]
-        
-        attn_windows = self.attn(x_windows_all, mask_all=x_window_masks_all)  # nW*B, window_size*window_size, C
-
-        attn_windows = attn_windows[:, :self.window_size ** 2]
+        # attn_windows = attn_windows[:, :self.window_size ** 2]
         
         # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+        # attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        # shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
 
         # reverse cyclic shift
         if self.shift_size > 0:
@@ -482,19 +269,19 @@ class FocalTransformerBlock(nn.Module):
         flops += self.dim * H * W
         
         # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size, self.window_size, self.focal_window)
+        # nW = H * W / self.window_size / self.window_size
+        flops += self.attn.flops(self.window_size * self.window_size)
 
-        if self.pool_method != "none" and self.focal_level > 1:
-            for k in range(self.focal_level-1):
-                window_size_glo = math.floor(self.window_size_glo / (2 ** k))
-                nW_glo = nW * (2**k)
-                # (sub)-window pooling
-                flops += nW_glo * self.dim * window_size_glo * window_size_glo         
-                # qkv for global levels
-                # NOTE: in our implementation, we pass the pooled window embedding to qkv embedding layer, 
-                # but theoritically, we only need to compute k and v.
-                flops += nW_glo * self.dim * 3 * self.dim       
+        # if self.pool_method != "none" and self.focal_level > 1:
+        #     for k in range(self.focal_level-1):
+        #         window_size_glo = math.floor(self.window_size_glo / (2 ** k))
+        #         nW_glo = nW * (2**k)
+        #         # (sub)-window pooling
+        #         flops += nW_glo * self.dim * window_size_glo * window_size_glo         
+        #         # qkv for global levels
+        #         # NOTE: in our implementation, we pass the pooled window embedding to qkv embedding layer, 
+        #         # but theoritically, we only need to compute k and v.
+        #         flops += nW_glo * self.dim * 3 * self.dim       
 
         # mlp
         flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
@@ -572,7 +359,9 @@ class BasicLayer(nn.Module):
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, pool_method="none", 
                  focal_level=1, focal_window=1, topK=64, use_conv_embed=False, use_shift=False, use_pre_norm=False, 
-                 downsample=None, use_checkpoint=False, use_layerscale=False, layerscale_value=1e-4):
+                 downsample=None, use_checkpoint=False, use_layerscale=False, layerscale_value=1e-4,
+                 approach_args={'approach_name': '4', 'padding': 'valid', 'stride': 1}
+                 ):
 
         super().__init__()
         self.dim = dim
@@ -589,22 +378,24 @@ class BasicLayer(nn.Module):
         
         # build blocks
         self.blocks = nn.ModuleList([
-            FocalTransformerBlock(dim=dim, input_resolution=input_resolution,
-                                 num_heads=num_heads, window_size=window_size,
-                                 shift_size=(0 if (i % 2 == 0) else window_size // 2) if use_shift else 0,
-                                 expand_size=0 if (i % 2 == expand_factor) else expand_size, 
-                                 mlp_ratio=mlp_ratio,
-                                 qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                 drop=drop, 
-                                 attn_drop=attn_drop,
-                                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                 norm_layer=norm_layer,
-                                 pool_method=pool_method, 
-                                 focal_level=focal_level, 
-                                 focal_window=focal_window, 
-                                 topK=topK, 
-                                 use_layerscale=use_layerscale, 
-                                 layerscale_value=layerscale_value)
+            CSAMBlock(
+                dim=dim, input_resolution=input_resolution,
+                num_heads=num_heads, window_size=window_size,
+                shift_size=(0 if (i % 2 == 0) else window_size // 2) if use_shift else 0,
+                expand_size=0 if (i % 2 == expand_factor) else expand_size, 
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop, 
+                attn_drop=attn_drop,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                pool_method=pool_method, 
+                focal_level=focal_level, 
+                focal_window=focal_window, 
+                topK=topK, 
+                use_layerscale=use_layerscale, 
+                layerscale_value=layerscale_value,
+                approach_args=approach_args)
             for i in range(depth)])
 
         # patch merging layer
@@ -714,7 +505,7 @@ class PatchEmbed(nn.Module):
         return flops
 
 
-class FocalTransformer(nn.Module):
+class CSAMTransformer(nn.Module):
     r""" Focal Transformer: Focal Self-attention for Local-Global Interactions in Vision Transformer
 
     Args:
@@ -779,7 +570,8 @@ class FocalTransformer(nn.Module):
                 use_conv_embed=False, 
                 use_layerscale=False, 
                 layerscale_value=1e-4, 
-                use_pre_norm=False, 
+                use_pre_norm=False,
+                approach_args={'approach_name': '4', 'padding': 'valid', 'stride': 1}, 
                 **kwargs):
         super().__init__()
 
@@ -838,7 +630,9 @@ class FocalTransformer(nn.Module):
                                use_pre_norm=use_pre_norm, 
                                use_checkpoint=use_checkpoint, 
                                use_layerscale=use_layerscale, 
-                               layerscale_value=layerscale_value)
+                               layerscale_value=layerscale_value,
+                               approach_args=approach_args
+                               )
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -906,7 +700,7 @@ if __name__ == '__main__':
     x = torch.rand(16, 3, img_size, img_size).cuda()
 
     # focal tiny
-    model = FocalTransformer(img_size=img_size, embed_dim=96, depths=[2,2,6,2], drop_path_rate=0.2, 
+    model = CSAMTransformer(img_size=img_size, embed_dim=96, depths=[2,2,6,2], drop_path_rate=0.2, 
         focal_levels=[2,2,2,2], expand_sizes=[3,3,3,3], expand_layer="all", 
         num_heads=[3,6,12,24],
         focal_windows=[7,5,3,1], 

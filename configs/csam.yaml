@@ -1,0 +1,22 @@
+approach_name: '3'
+pos_emb_dim: -1 #10
+softmax_temp: 1
+injection_info: [   # list of lists
+  # [7, 1, 3] # [InjectionLayer,NumStack,FilterSize]
+]
+padding: same
+stride: 1
+apply_stochastic_stride: False
+use_residual_connection: False
+suffix: 
+# self.conv1,     # 0
+# self.bn1,       # 1
+# self.relu,      # 2
+# self.maxpool,   # 3
+# self.layer1,    # 4
+# self.layer2,    # 5
+# self.layer3,    # 6
+# self.layer4,    # 7
+# self.avgpool,   # 8
+# self.flatten,   # 9
+# self.fc         # 10

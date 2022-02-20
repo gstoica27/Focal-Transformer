@@ -13,12 +13,13 @@ from timm.models.layers import trunc_normal_
 
 try:
     # noinspection PyUnresolvedReferences
-    from apex import amp
+    # from apex import amp
+    import torch.cuda.amp as amp
 except ImportError:
     amp = None
 
 
-def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
+def load_checkpoint(config, model, optimizer, lr_scheduler, logger, scaler):
     logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")
     if config.MODEL.RESUME.startswith('https'):
         checkpoint = torch.hub.load_state_dict_from_url(
@@ -46,7 +47,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
         config.TRAIN.START_EPOCH = checkpoint['epoch'] + 1
         config.freeze()
         if 'amp' in checkpoint and config.AMP_OPT_LEVEL != "O0" and checkpoint['config'].AMP_OPT_LEVEL != "O0":
-            amp.load_state_dict(checkpoint['amp'])
+            scaler.load_state_dict(checkpoint['amp'])
         logger.info(f"=> loaded successfully '{config.MODEL.RESUME}' (epoch {checkpoint['epoch']})")
         if 'max_accuracy' in checkpoint:
             max_accuracy = checkpoint['max_accuracy']
@@ -56,7 +57,7 @@ def load_checkpoint(config, model, optimizer, lr_scheduler, logger):
     return max_accuracy
 
 
-def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, logger):
+def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler, logger, grad_scaler):
     save_state = {'model': model.state_dict(),
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
@@ -64,7 +65,7 @@ def save_checkpoint(config, epoch, model, max_accuracy, optimizer, lr_scheduler,
                   'epoch': epoch,
                   'config': config}
     if config.AMP_OPT_LEVEL != "O0":
-        save_state['amp'] = amp.state_dict()
+        save_state['amp'] = grad_scaler.state_dict()
 
     save_path = os.path.join(config.OUTPUT, f'ckpt_epoch_{epoch}.pth')
     logger.info(f"{save_path} saving......")
