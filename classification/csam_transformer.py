@@ -170,18 +170,18 @@ class CSAMBlock(nn.Module):
 
         self.window_size_glo = self.window_size
 
-        self.pool_layers = nn.ModuleList()
-        if self.pool_method != "none":
-            for k in range(self.focal_level-1):
-                window_size_glo = math.floor(self.window_size_glo / (2 ** k))
-                if self.pool_method == "fc":
-                    self.pool_layers.append(nn.Linear(window_size_glo * window_size_glo, 1))
-                    self.pool_layers[-1].weight.data.fill_(1./(window_size_glo * window_size_glo))
-                    self.pool_layers[-1].bias.data.fill_(0)
-                elif self.pool_method == "conv":
-                    self.pool_layers.append(nn.Conv2d(dim, dim, kernel_size=window_size_glo, stride=window_size_glo, groups=dim))
+        # self.pool_layers = nn.ModuleList()
+        # if self.pool_method != "none":
+        #     for k in range(self.focal_level-1):
+        #         window_size_glo = math.floor(self.window_size_glo / (2 ** k))
+        #         if self.pool_method == "fc":
+        #             self.pool_layers.append(nn.Linear(window_size_glo * window_size_glo, 1))
+        #             self.pool_layers[-1].weight.data.fill_(1./(window_size_glo * window_size_glo))
+        #             self.pool_layers[-1].bias.data.fill_(0)
+        #         elif self.pool_method == "conv":
+        #             self.pool_layers.append(nn.Conv2d(dim, dim, kernel_size=window_size_glo, stride=window_size_glo, groups=dim))
 
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, eps=6.1e-5)
         # import pdb; pdb.set_trace()
         self.attn = ConvolutionalSelfAttention(
             spatial_shape=list(input_resolution) + [dim],
@@ -190,7 +190,7 @@ class CSAMBlock(nn.Module):
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, eps=6.1e-5)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -237,7 +237,7 @@ class CSAMBlock(nn.Module):
             shifted_x = x
         
         # import pdb; pdb.set_trace()
-        attn_windows = self.attn(shifted_x)  # nW*B, window_size*window_size, C
+        shifted_x = self.attn(shifted_x)  # nW*B, window_size*window_size, C
 
         # attn_windows = attn_windows[:, :self.window_size ** 2]
         
@@ -304,7 +304,7 @@ class PatchMerging(nn.Module):
         self.input_resolution = img_size
         self.dim = in_chans
         self.reduction = nn.Linear(4 * in_chans, 2 * in_chans, bias=False)
-        self.norm = norm_layer(4 * in_chans)
+        self.norm = norm_layer(4 * in_chans, eps=6.1e-5)
 
     def forward(self, x):
         """
@@ -471,12 +471,12 @@ class PatchEmbed(nn.Module):
 
         if self.use_pre_norm:
             if norm_layer is not None:
-                self.pre_norm = nn.GroupNorm(1, in_chans)
+                self.pre_norm = nn.GroupNorm(1, in_chans, eps=6.1e-5)
             else:
                 self.pre_norm = None
 
         if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
+            self.norm = norm_layer(embed_dim, eps=6.1e-5)
         else:
             self.norm = None
 
@@ -635,7 +635,7 @@ class CSAMTransformer(nn.Module):
                                )
             self.layers.append(layer)
 
-        self.norm = norm_layer(self.num_features)
+        self.norm = norm_layer(self.num_features, eps=6.1e-5)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 

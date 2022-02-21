@@ -97,9 +97,9 @@ class ConvolutionalSelfAttention(nn.Module):
 
     # expects image to be [B,C,H,W]
     def undo_padding(self, image):
-        _, _, H, W = image.shape
+        _, H, W, _ = image.shape
         left_pad, right_pad, top_pad, bottom_pad = self.padding_tuple
-        return image[:, :, top_pad:H-bottom_pad, left_pad:W-right_pad]
+        return image[:, top_pad:H-bottom_pad, left_pad:W-right_pad, :]
 
     def get_num_convs(self):
         h_dim = int((self.spatial_H - self.filter_K) / self.stride) + 1
@@ -122,7 +122,13 @@ class ConvolutionalSelfAttention(nn.Module):
         if self.approach_name == '1':
             self.global_transform = nn.Linear(self.X_encoding_dim, self.filter_K * self.filter_K)
         elif self.approach_name == 'Two':
-            self.global_transform = nn.Linear(self.X_encoding_dim, 1)
+            if self.input_H == self.filter_K or self.input_W == self.filter_K:
+                self.key_transform = nn.Linear(self.spatial_C, self.spatial_C)
+                self.query_transform = nn.Linear(self.spatial_C, self.spatial_C)
+                self.value_transform = nn.Linear(self.spatial_C, self.spatial_C)
+            else:
+                # self.global_transform = nn.Linear(self.X_encoding_dim, 1, bias=False)
+                self.global_transform = nn.Linear(self.spatial_C, self.spatial_H * self.spatial_W)
         elif self.approach_name == 'Three':
             self.global_transform = nn.Linear(self.X_encoding_dim, self.spatial_C)
         elif self.approach_name == '4' or self.approach_name == '4_mem_efficient':
@@ -286,13 +292,19 @@ class ConvolutionalSelfAttention(nn.Module):
         return batch
 
     def efficient_approach2(self, batch):
-
+        # No background information available. Apply Self Attention
+        if (1 - self.padding_mask).sum() == self.filter_K * self.filter_K:
+            batch = self.undo_padding(batch)
+            return self.forward_on_self_attention(batch)
         batch_pos = self.maybe_add_positional_encodings(batch)
         global_mask = (1 - self.padding_mask.reshape(1, -1)) - self.local_mask                                          # [Nc,HW]
         batch_flat = batch_pos.flatten(1, 2)                                                                            # [B,H,W,C] -> [B,HW,C]
-        gX = self.global_transform(batch_flat)                                                                          # [B,HW,C] -> [B,HW,1]
+        # gX = self.global_transform(batch_flat)                                                                          # [B,HW,C] -> [B,HW,1]
+        # pdb.set_trace()
+        gX = (self.global_transform.weight.unsqueeze(0) * batch_flat).sum(-1, keepdim=True) + \
+            self.global_transform.bias.reshape(1, -1, 1)
         cos_sim = self.cosine_similarity(batch_flat, batch_flat)                                                        # [B,HW,C]x[B,HW,C] -> [B,HW,HW]
-        exp_sim = torch.exp(cos_sim - cos_sim.mean(dim=-1, keepdim=True)[0])                                            # [B,HW,HW]
+        exp_sim = torch.exp(cos_sim - cos_sim.max(dim=-1, keepdim=True)[0])                                            # [B,HW,HW]
         exp_sum = torch.einsum('ijk,kl->ijl', exp_sim, global_mask.transpose(1, 0))                                     # [B,HW,HW]x[HW,Nc] -> [B,HW,Nc]
         inverted_sum = 1. / exp_sum                                                                                     # [B,HW,Nc]
         masked_denominator = inverted_sum * self.local_mask.transpose(1,0).unsqueeze(0)                                 # [B,HW,Nc]x([Nc,Hw] -> [HW,Nc] -> [1,HW,Nc]) -> [B,HW,Nc]
@@ -301,6 +313,8 @@ class ConvolutionalSelfAttention(nn.Module):
         extended_filter = g_sum * masked_denominator                                                                    # [B,HW,Nc]
         result = torch.bmm(batch_flat.transpose(2, 1), extended_filter).transpose(2, 1)                                 # ([B,HW,C] -> [B,C,HW])x[B,HW,Nc] -> [B,C,Nc] -> [B,Nc,C]
 
+        if result.isnan().sum() > 0:
+            pdb.set_trace()
         return result[:,:,:self.spatial_C].reshape(
             -1, self.convs_height, self.convs_width, self.spatial_C
         )                                                                                                               # [B,Nc,C] -> [B,F,F,C]

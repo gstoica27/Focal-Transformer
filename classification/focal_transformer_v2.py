@@ -347,7 +347,7 @@ class FocalTransformerBlock(nn.Module):
                 elif self.pool_method == "conv":
                     self.pool_layers.append(nn.Conv2d(dim, dim, kernel_size=window_size_glo, stride=window_size_glo, groups=dim))
 
-        self.norm1 = norm_layer(dim)
+        self.norm1 = norm_layer(dim, eps=6.1e-5)
         self.attn = WindowAttention(
             dim, input_resolution=input_resolution, expand_size=self.expand_size, shift_size=self.shift_size, window_size=to_2tuple(self.window_size), 
             window_size_glo=to_2tuple(self.window_size_glo), focal_window=focal_window, 
@@ -356,7 +356,7 @@ class FocalTransformerBlock(nn.Module):
             pool_method=pool_method, topK=topK)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
+        self.norm2 = norm_layer(dim, eps=6.1e-5)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
@@ -517,7 +517,7 @@ class PatchMerging(nn.Module):
         self.input_resolution = img_size
         self.dim = in_chans
         self.reduction = nn.Linear(4 * in_chans, 2 * in_chans, bias=False)
-        self.norm = norm_layer(4 * in_chans)
+        self.norm = norm_layer(4 * in_chans, eps=6.1e-5)
 
     def forward(self, x):
         """
@@ -680,12 +680,12 @@ class PatchEmbed(nn.Module):
 
         if self.use_pre_norm:
             if norm_layer is not None:
-                self.pre_norm = nn.GroupNorm(1, in_chans)
+                self.pre_norm = nn.GroupNorm(1, in_chans, eps=6.1e-5)
             else:
                 self.pre_norm = None
 
         if norm_layer is not None:
-            self.norm = norm_layer(embed_dim)
+            self.norm = norm_layer(embed_dim, eps=6.1e-5)
         else:
             self.norm = None
 
@@ -841,7 +841,7 @@ class FocalTransformer(nn.Module):
                                layerscale_value=layerscale_value)
             self.layers.append(layer)
 
-        self.norm = norm_layer(self.num_features)
+        self.norm = norm_layer(self.num_features, eps=6.1e-5)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 

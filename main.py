@@ -5,7 +5,7 @@
 # Modified by Jianwei Yang (jianwyan@microsoft.com)
 # Based on Swin Transformer written by Zhe Liu
 # --------------------------------------------------------
-
+import pdb
 import os
 import time
 import argparse
@@ -90,7 +90,7 @@ def main(config):
     optimizer = build_optimizer(config, model)
     # if config.AMP_OPT_LEVEL != "O0":
     #     model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False, find_unused_parameters=True)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)#, find_unused_parameters=True)
     model_without_ddp = model.module
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -166,84 +166,88 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
     start = time.time()
     end = time.time()
     for idx, (samples, targets) in enumerate(data_loader):
-        samples = samples.cuda(non_blocking=True)
-        targets = targets.cuda(non_blocking=True)
+        with torch.autograd.detect_anomaly():
+            samples = samples.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
 
-        if mixup_fn is not None:
-            samples, targets = mixup_fn(samples, targets)
-        
-        if config.AMP_OPT_LEVEL != "O0":
-            with torch.cuda.amp.autocast():
-                outputs = model(samples)
-        else:
-            outputs = model(samples)
-
-        if config.TRAIN.ACCUMULATION_STEPS > 1:
+            if mixup_fn is not None:
+                samples, targets = mixup_fn(samples, targets)
+            
             if config.AMP_OPT_LEVEL != "O0":
                 with torch.cuda.amp.autocast():
-                    loss = criterion(outputs, targets)
-                    loss = loss / config.TRAIN.ACCUMULATION_STEPS
-                # with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaler.scale(loss).backward()
-                try:
-                    scaler.unscale_(optimizer)
-                except:
-                    pass
-                if config.TRAIN.CLIP_GRAD:
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    # grad_norm = get_grad_norm(amp.master_params(optimizer))
-                    grad_norm = get_grad_norm(model.parameters())
+                    outputs = model(samples)
             else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
-            
-            if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+                outputs = model(samples)
+
+            if config.TRAIN.ACCUMULATION_STEPS > 1:
                 if config.AMP_OPT_LEVEL != "O0":
-                    # with torch.cuda.amp.autocast():
-                    scaler.step(optimizer)
-                    scaler.update()
+                    with torch.cuda.amp.autocast():
+                        loss = criterion(outputs, targets)
+                        loss = loss / config.TRAIN.ACCUMULATION_STEPS
+                        # if loss.isnan():
+                        #     pdb.set_trace()
+                    # with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaler.scale(loss).backward()
+                    try:
+                        scaler.unscale_(optimizer)
+                    except:
+                        pass
+                    if config.TRAIN.CLIP_GRAD:
+                        # grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                    else:
+                        # grad_norm = get_grad_norm(amp.master_params(optimizer))
+                        grad_norm = get_grad_norm(model.parameters())
+                else:
+                    loss.backward()
+                    if config.TRAIN.CLIP_GRAD:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                    else:
+                        grad_norm = get_grad_norm(model.parameters())
+                # pdb.set_trace()
+                if (idx + 1) % config.TRAIN.ACCUMULATION_STEPS == 0:
+                    if config.AMP_OPT_LEVEL != "O0":
+                        # with torch.cuda.amp.autocast():
+                        # pdb.set_trace()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad()
+                    
+                    lr_scheduler.step_update(epoch * num_steps + idx)
+            else:
+                if config.AMP_OPT_LEVEL != "O0":
+                    with torch.cuda.amp.autocast():
+                        loss = criterion(outputs, targets)
+                else:
+                    loss = criterion(outputs, targets)
+                optimizer.zero_grad()
+
+                if config.AMP_OPT_LEVEL != "O0":
+                    # with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        # scaled_loss.backward()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    if config.TRAIN.CLIP_GRAD:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                        # grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
+                    else:
+                        # grad_norm = get_grad_norm(amp.master_params(optimizer))
+                        grad_norm = get_grad_norm(model.parameters())
+                else:
+                    loss.backward()
+                    if config.TRAIN.CLIP_GRAD:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
+                    else:
+                        grad_norm = get_grad_norm(model.parameters())
+                if config.AMP_OPT_LEVEL != "O0":
+                        # with torch.cuda.amp.autocast():
+                        scaler.step(optimizer)
+                        scaler.update()
                 else:
                     optimizer.step()
-                optimizer.zero_grad()
-                
                 lr_scheduler.step_update(epoch * num_steps + idx)
-        else:
-            if config.AMP_OPT_LEVEL != "O0":
-                with torch.cuda.amp.autocast():
-                    loss = criterion(outputs, targets)
-            else:
-                loss = criterion(outputs, targets)
-            optimizer.zero_grad()
-
-            if config.AMP_OPT_LEVEL != "O0":
-                # with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    # scaled_loss.backward()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), config.TRAIN.CLIP_GRAD)
-                else:
-                    # grad_norm = get_grad_norm(amp.master_params(optimizer))
-                    grad_norm = get_grad_norm(model.parameters())
-            else:
-                loss.backward()
-                if config.TRAIN.CLIP_GRAD:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.TRAIN.CLIP_GRAD)
-                else:
-                    grad_norm = get_grad_norm(model.parameters())
-            if config.AMP_OPT_LEVEL != "O0":
-                    # with torch.cuda.amp.autocast():
-                    scaler.step(optimizer)
-                    scaler.update()
-            else:
-                optimizer.step()
-            lr_scheduler.step_update(epoch * num_steps + idx)
 
         torch.cuda.synchronize()
 
